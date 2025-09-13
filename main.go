@@ -158,26 +158,131 @@ func run(args []string) int {
 	//nolint:errcheck
 	defer f.Close()
 
-	services := GetServices(f)
+	// Always use the optimized streaming version for better performance and scalability
+	return streamHealthCheck(f, os.Stdout)
+}
 
-	// Validation : vérifier que toutes les lignes sont des URLs valides
-	for _, url := range services {
-		if !isValidURL(url) {
-			fmt.Fprintf(os.Stderr, "Error: Invalid URL: %s (only HTTP/HTTPS allowed)\n", url)
-			return ExitError
+// streamHealthCheck processes URLs in a streaming fashion for scalability
+// Why this is better for millions of URLs:
+// 1. Constant memory usage (O(1)) instead of O(n) - only MaxConcurrentRequests URLs in memory
+// 2. Results are output immediately as they complete
+// 3. Can handle infinite streams or files larger than available RAM
+// 4. Early termination possible (can stop processing if needed)
+func streamHealthCheck(r io.Reader, w io.Writer) int {
+	return streamHealthCheckWithContext(context.Background(), r, w)
+}
+
+func streamHealthCheckWithContext(ctx context.Context, r io.Reader, w io.Writer) int {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Channel pipeline: Reader -> URL channel -> Result channel -> Writer
+	urlChan := make(chan string, MaxConcurrentRequests)
+	resultChan := make(chan Result, MaxConcurrentRequests)
+
+	// Producer: Read URLs from file and send to channel
+	go func() {
+		defer close(urlChan)
+		scanner := bufio.NewScanner(r)
+		lineNum := 0
+
+		for scanner.Scan() {
+			lineNum++
+			url := scanner.Text()
+
+			// Skip empty lines
+			if url == "" {
+				continue
+			}
+
+			// Validate URL - skip invalid URLs with warning
+			if !isValidURL(url) {
+				fmt.Fprintf(w, "Line %d: Invalid URL: %s (only HTTP/HTTPS allowed)\n", lineNum, url)
+				continue
+			}
+
+			select {
+			case urlChan <- url:
+			case <-ctx.Done():
+				return
+			}
 		}
+
+		if err := scanner.Err(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
+		}
+	}()
+
+	// Workers: Process URLs concurrently (MaxConcurrentRequests workers)
+	var wg sync.WaitGroup
+	for i := 0; i < MaxConcurrentRequests; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			for url := range urlChan {
+				result := checkURL(ctx, url)
+
+				select {
+				case resultChan <- result:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
 	}
 
-	results := HealthCheck(services)
-	for _, res := range results {
-		if res.Err != nil {
-			fmt.Printf("Url: %s; Error: %s\n", res.URL, res.Err)
-			continue
+	// Close result channel when all workers done
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Consumer: Output results immediately
+	for result := range resultChan {
+		if result.Err != nil {
+			fmt.Fprintf(w, "Url: %s; Error: %s\n", result.URL, result.Err)
+		} else {
+			fmt.Fprintf(w, "Url: %s; Status: %d; Latency: %s\n",
+				result.URL, result.Status, result.Latency.Round(time.Millisecond))
 		}
-		fmt.Printf("Url: %s; Status: %d; Latency: %s\n", res.URL, res.Status, res.Latency.Round(time.Millisecond))
 	}
 
 	return ExitSuccess
+}
+
+// checkURL performs a single URL health check
+func checkURL(ctx context.Context, url string) Result {
+	var result Result
+	result.URL = url
+	start := time.Now()
+
+	reqCtx, cancel := context.WithTimeout(ctx, RequestTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		result.Err = err
+		result.Latency = time.Since(start)
+		return result
+	}
+
+	req.Header.Set("User-Agent", UserAgent)
+
+	resp, err := httpClient.Do(req)
+	result.Latency = time.Since(start)
+
+	if err != nil {
+		result.Err = err
+	} else {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		if cerr := resp.Body.Close(); cerr != nil {
+			log.Printf("Warning: failed to close response body for %s: %v", url, cerr)
+		}
+		result.Status = resp.StatusCode
+	}
+
+	return result
 }
 
 // HealthCheck reports if a list of web services is up and running.
@@ -185,11 +290,11 @@ func HealthCheck(urls []string) []Result {
 	results := make([]Result, len(urls))
 
 	// Concurrency limiter using buffered semaphore channel
-	sem := make(chan struct{}, MaxConcurrentRequests)
+	sem := make(chan struct{}, min(MaxConcurrentRequests, len(urls)))
 
 	var wg sync.WaitGroup
 	wg.Add(len(urls))
-	for i, url := range urls {
+	for i := range len(urls) { // Go 1.23+ range over int
 		// Acquire semaphore BEFORE creating goroutine (blocks if full)
 		sem <- struct{}{}
 		go func(idx int, targetURL string) {
@@ -227,7 +332,7 @@ func HealthCheck(urls []string) []Result {
 				result.Status = resp.StatusCode
 			}
 			results[idx] = result
-		}(i, url)
+		}(i, urls[i])
 	}
 
 	wg.Wait()
@@ -258,7 +363,7 @@ func isValidURL(s string) bool {
 
 // GetServices reads each line of the input reader and returns a list of URLs.
 func GetServices(r io.Reader) []string {
-	urls := make([]string, 0)
+	urls := make([]string, 0, 100) // Pre-allocate for better performance
 	scanner := bufio.NewScanner(r)
 	scanner.Split(bufio.ScanLines)
 	for scanner.Scan() {

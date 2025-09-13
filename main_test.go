@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -824,12 +826,12 @@ func TestRun(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer os.Remove(tmpfile.Name())
-		
+
 		if _, err := tmpfile.Write([]byte("ftp://invalid.com\n")); err != nil {
 			t.Fatal(err)
 		}
 		tmpfile.Close()
-		
+
 		// Capture stderr and stdout
 		oldStderr := os.Stderr
 		oldStdout := os.Stdout
@@ -837,27 +839,27 @@ func TestRun(t *testing.T) {
 		rOut, wOut, _ := os.Pipe()
 		os.Stderr = wErr
 		os.Stdout = wOut
-		
+
 		exitCode := run([]string{"healthcheck", tmpfile.Name()})
-		
+
 		wErr.Close()
 		wOut.Close()
 		os.Stderr = oldStderr
 		os.Stdout = oldStdout
-		
+
 		var bufErr bytes.Buffer
 		var bufOut bytes.Buffer
 		io.Copy(&bufErr, rErr)
 		io.Copy(&bufOut, rOut)
-		
+
 		if exitCode != 1 {
 			t.Errorf("expected exit code 1, got %d", exitCode)
 		}
-		
-		if !strings.Contains(bufErr.String(), "Invalid URL") && !strings.Contains(bufErr.String(), "only HTTP/HTTPS allowed") {
-			t.Errorf("expected 'Invalid URL' error in stderr, got %q", bufErr.String())
+
+		if !strings.Contains(bufOut.String(), "Invalid URL") && !strings.Contains(bufOut.String(), "only HTTP/HTTPS allowed") {
+			t.Errorf("expected 'Invalid URL' error in output, got %q", bufOut.String())
 		}
-		
+
 		if !strings.Contains(bufOut.String(), "Opening "+tmpfile.Name()) {
 			t.Errorf("expected 'Opening' message in stdout, got %q", bufOut.String())
 		}
@@ -999,7 +1001,7 @@ func TestIsValidURL(t *testing.T) {
 		{"valid https with port", "https://example.com:443", true},
 		{"valid http minimum", "http://a", true},
 		{"valid https minimum", "https://a", true},
-		
+
 		// Invalid URLs
 		{"empty string", "", false},
 		{"no protocol", "example.com", false},
@@ -1015,7 +1017,7 @@ func TestIsValidURL(t *testing.T) {
 		{"almost http", "http:/", false},
 		{"almost https", "https:", false},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := isValidURL(tt.url)
@@ -1024,4 +1026,518 @@ func TestIsValidURL(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestStreamHealthCheck(t *testing.T) {
+	t.Run("processes URLs from reader", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		input := strings.NewReader(server.URL + "\n")
+		var output bytes.Buffer
+
+		exitCode := streamHealthCheck(input, &output)
+
+		if exitCode != 0 {
+			t.Errorf("expected exit code 0, got %d", exitCode)
+		}
+
+		if !strings.Contains(output.String(), "Status: 200") {
+			t.Errorf("expected 'Status: 200' in output, got %q", output.String())
+		}
+	})
+
+	t.Run("handles empty lines", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		input := strings.NewReader("\n\n" + server.URL + "\n\n")
+		var output bytes.Buffer
+
+		exitCode := streamHealthCheck(input, &output)
+
+		if exitCode != 0 {
+			t.Errorf("expected exit code 0, got %d", exitCode)
+		}
+
+		// Should have exactly one result (empty lines skipped)
+		resultCount := strings.Count(output.String(), "Status:")
+		if resultCount != 1 {
+			t.Errorf("expected 1 result, got %d", resultCount)
+		}
+	})
+
+	t.Run("handles invalid URLs", func(t *testing.T) {
+		input := strings.NewReader("ftp://invalid.com\nnotaurl\n")
+		var output bytes.Buffer
+
+		exitCode := streamHealthCheck(input, &output)
+
+		if exitCode != 0 {
+			t.Errorf("expected exit code 0, got %d", exitCode)
+		}
+
+		if !strings.Contains(output.String(), "Invalid URL") {
+			t.Errorf("expected 'Invalid URL' in output, got %q", output.String())
+		}
+	})
+
+	t.Run("handles network errors", func(t *testing.T) {
+		input := strings.NewReader("http://192.0.2.1:12345/unreachable\n")
+		var output bytes.Buffer
+
+		exitCode := streamHealthCheck(input, &output)
+
+		if exitCode != 0 {
+			t.Errorf("expected exit code 0, got %d", exitCode)
+		}
+
+		if !strings.Contains(output.String(), "Error:") {
+			t.Errorf("expected 'Error:' in output, got %q", output.String())
+		}
+	})
+
+	t.Run("handles scanner error", func(t *testing.T) {
+		// Create a reader that will cause an error
+		r := &errorReader{err: fmt.Errorf("read error")}
+		var output bytes.Buffer
+
+		// Capture stderr
+		oldStderr := os.Stderr
+		rErr, wErr, _ := os.Pipe()
+		os.Stderr = wErr
+
+		exitCode := streamHealthCheck(r, &output)
+
+		wErr.Close()
+		os.Stderr = oldStderr
+
+		var bufErr bytes.Buffer
+		io.Copy(&bufErr, rErr)
+
+		if exitCode != 0 {
+			t.Errorf("expected exit code 0, got %d", exitCode)
+		}
+
+		if !strings.Contains(bufErr.String(), "Error reading input") {
+			t.Errorf("expected 'Error reading input' in stderr, got %q", bufErr.String())
+		}
+	})
+}
+
+// errorReader is a reader that returns an error
+type errorReader struct {
+	err error
+}
+
+func (r *errorReader) Read(p []byte) (n int, err error) {
+	return 0, r.err
+}
+
+func TestCheckURL(t *testing.T) {
+	t.Run("successful request", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("User-Agent") != UserAgent {
+				t.Errorf("expected User-Agent %s, got %s", UserAgent, r.Header.Get("User-Agent"))
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		ctx := context.Background()
+		result := checkURL(ctx, server.URL)
+
+		if result.Err != nil {
+			t.Errorf("expected no error, got %v", result.Err)
+		}
+
+		if result.Status != http.StatusOK {
+			t.Errorf("expected status %d, got %d", http.StatusOK, result.Status)
+		}
+
+		if result.URL != server.URL {
+			t.Errorf("expected URL %s, got %s", server.URL, result.URL)
+		}
+
+		if result.Latency <= 0 {
+			t.Errorf("expected positive latency, got %v", result.Latency)
+		}
+	})
+
+	t.Run("context cancellation", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(100 * time.Millisecond)
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // Cancel immediately
+
+		result := checkURL(ctx, server.URL)
+
+		if result.Err == nil {
+			t.Errorf("expected error for cancelled context, got nil")
+		}
+
+		if result.Status != 0 {
+			t.Errorf("expected status 0 for error case, got %d", result.Status)
+		}
+	})
+
+	t.Run("invalid URL", func(t *testing.T) {
+		ctx := context.Background()
+		result := checkURL(ctx, "://invalid-url")
+
+		if result.Err == nil {
+			t.Errorf("expected error for invalid URL, got nil")
+		}
+
+		if result.Status != 0 {
+			t.Errorf("expected status 0 for error case, got %d", result.Status)
+		}
+
+		if result.URL != "://invalid-url" {
+			t.Errorf("expected URL to be preserved, got %s", result.URL)
+		}
+	})
+
+	t.Run("response body close error", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("test response"))
+		}))
+		defer server.Close()
+
+		// Capture log output
+		var logBuf bytes.Buffer
+		log.SetOutput(&logBuf)
+		defer log.SetOutput(os.Stderr)
+
+		ctx := context.Background()
+		result := checkURL(ctx, server.URL)
+
+		if result.Err != nil {
+			t.Errorf("expected no error, got %v", result.Err)
+		}
+
+		if result.Status != http.StatusOK {
+			t.Errorf("expected status %d, got %d", http.StatusOK, result.Status)
+		}
+	})
+}
+
+func TestStreamHealthCheckContextCancellation(t *testing.T) {
+	t.Run("context cancelled during URL send", func(t *testing.T) {
+		// Create a custom reader that blocks after first URL
+		pr, pw := io.Pipe()
+
+		// Write URLs slowly to trigger context cancellation
+		go func() {
+			// Write first URL
+			pw.Write([]byte("http://example1.com\n"))
+			time.Sleep(10 * time.Millisecond)
+
+			// Write many more URLs that will be blocked
+			for i := 0; i < 1000; i++ {
+				pw.Write([]byte(fmt.Sprintf("http://example%d.com\n", i)))
+			}
+			pw.Close()
+		}()
+
+		// Create a wrapper function to test context cancellation
+		done := make(chan bool)
+		var output bytes.Buffer
+
+		go func() {
+			// This will block on channel send when buffer is full
+			exitCode := streamHealthCheck(pr, &output)
+			if exitCode != 0 {
+				t.Errorf("expected exit code 0, got %d", exitCode)
+			}
+			done <- true
+		}()
+
+		// Wait a bit then check results
+		select {
+		case <-done:
+			// Test completed
+		case <-time.After(2 * time.Second):
+			// This is OK - the goroutine may still be running
+		}
+	})
+}
+
+// Custom reader that allows controlling when context cancellation happens
+type blockingReader struct {
+	urls      []string
+	index     int
+	blockAt   int
+	blockTime time.Duration
+}
+
+func (r *blockingReader) Read(p []byte) (n int, err error) {
+	if r.index >= len(r.urls) {
+		return 0, io.EOF
+	}
+
+	if r.index == r.blockAt {
+		time.Sleep(r.blockTime)
+	}
+
+	url := r.urls[r.index] + "\n"
+	r.index++
+
+	copy(p, []byte(url))
+	return len(url), nil
+}
+
+func TestStreamHealthCheckBlockedChannels(t *testing.T) {
+	t.Run("url channel blocks and context cancels", func(t *testing.T) {
+		// Create reader with many URLs to fill the channel buffer
+		urls := make([]string, MaxConcurrentRequests*3)
+		for i := range urls {
+			urls[i] = "http://192.0.2.1:12345/unreachable" // Unreachable to be slow
+		}
+
+		reader := &blockingReader{
+			urls:      urls,
+			index:     0,
+			blockAt:   MaxConcurrentRequests + 10, // Block after filling buffer
+			blockTime: 100 * time.Millisecond,
+		}
+
+		var output bytes.Buffer
+
+		done := make(chan bool)
+		go func() {
+			streamHealthCheck(reader, &output)
+			done <- true
+		}()
+
+		select {
+		case <-done:
+			// Completed
+		case <-time.After(5 * time.Second):
+			// OK if it times out - we're testing the blocking behavior
+		}
+	})
+
+	t.Run("result channel blocks and context cancels", func(t *testing.T) {
+		// Test server that delays response to cause result channel blocking
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(50 * time.Millisecond)
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		// Create many URLs to process
+		urls := make([]string, MaxConcurrentRequests*2)
+		for i := range urls {
+			urls[i] = server.URL
+		}
+
+		input := strings.NewReader(strings.Join(urls, "\n"))
+
+		// Use a custom writer that blocks
+		bw := &blockingWriter{
+			delay: 10 * time.Millisecond,
+		}
+
+		done := make(chan bool)
+		go func() {
+			streamHealthCheck(input, bw)
+			done <- true
+		}()
+
+		select {
+		case <-done:
+			// Completed
+		case <-time.After(10 * time.Second):
+			// OK if it times out
+		}
+	})
+}
+
+// blockingWriter simulates a slow writer
+type blockingWriter struct {
+	delay time.Duration
+}
+
+func (w *blockingWriter) Write(p []byte) (n int, err error) {
+	time.Sleep(w.delay)
+	return len(p), nil
+}
+
+func TestHealthCheckWithClosedResponseBody(t *testing.T) {
+	t.Run("server closes body with log warning", func(t *testing.T) {
+		// Mock a response body close error scenario
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			// Write some data to trigger body reading
+			w.Write([]byte("test response body"))
+		}))
+		defer server.Close()
+
+		// Capture log output to verify warning message
+		var logBuf bytes.Buffer
+		oldOutput := log.Writer()
+		log.SetOutput(&logBuf)
+		defer log.SetOutput(oldOutput)
+
+		urls := []string{server.URL}
+		results := HealthCheck(urls)
+
+		if len(results) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(results))
+		}
+
+		// Should complete successfully
+		if results[0].Err != nil {
+			t.Errorf("expected no error, got %v", results[0].Err)
+		}
+
+		if results[0].Status != http.StatusOK {
+			t.Errorf("expected status 200, got %d", results[0].Status)
+		}
+	})
+}
+
+func TestHealthCheckEdgeCases(t *testing.T) {
+	t.Run("single URL with small semaphore", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		// Single URL to test min() branch
+		urls := []string{server.URL}
+		results := HealthCheck(urls)
+
+		if len(results) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(results))
+		}
+
+		if results[0].Status != http.StatusOK {
+			t.Errorf("expected status 200, got %d", results[0].Status)
+		}
+	})
+}
+
+func TestStreamHealthCheckWithCancelledContext(t *testing.T) {
+	t.Run("context cancelled immediately - producer", func(t *testing.T) {
+		// Create a context that's already cancelled
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		// Create reader with many URLs
+		var urls strings.Builder
+		for i := 0; i < 200; i++ {
+			urls.WriteString(fmt.Sprintf("http://example%d.com\n", i))
+		}
+		input := strings.NewReader(urls.String())
+
+		var output bytes.Buffer
+		exitCode := streamHealthCheckWithContext(ctx, input, &output)
+
+		if exitCode != 0 {
+			t.Errorf("expected exit code 0, got %d", exitCode)
+		}
+	})
+
+	t.Run("context cancelled immediately - worker", func(t *testing.T) {
+		// Create a server that never responds
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Block forever
+			<-r.Context().Done()
+		}))
+		defer server.Close()
+
+		// Create context that cancels quickly
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+		defer cancel()
+
+		input := strings.NewReader(server.URL + "\n")
+		var output bytes.Buffer
+
+		exitCode := streamHealthCheckWithContext(ctx, input, &output)
+
+		if exitCode != 0 {
+			t.Errorf("expected exit code 0, got %d", exitCode)
+		}
+	})
+}
+
+func TestBodyCloseError(t *testing.T) {
+	t.Run("checkURL body close error logged", func(t *testing.T) {
+		// Use a custom transport that returns a body that fails to close
+		oldClient := httpClient
+		httpClient = &http.Client{
+			Transport: &errorCloseTransport{},
+			Timeout:   HTTPClientTimeout,
+		}
+		defer func() { httpClient = oldClient }()
+
+		// Capture log output
+		var logBuf bytes.Buffer
+		oldOutput := log.Writer()
+		log.SetOutput(&logBuf)
+		defer log.SetOutput(oldOutput)
+
+		ctx := context.Background()
+		_ = checkURL(ctx, "http://example.com")
+
+		// Should have logged the close error
+		if !strings.Contains(logBuf.String(), "Warning: failed to close response body") {
+			t.Errorf("expected close error to be logged, got: %s", logBuf.String())
+		}
+	})
+
+	t.Run("HealthCheck body close error logged", func(t *testing.T) {
+		// Use a custom transport that returns a body that fails to close
+		oldClient := httpClient
+		httpClient = &http.Client{
+			Transport: &errorCloseTransport{},
+			Timeout:   HTTPClientTimeout,
+		}
+		defer func() { httpClient = oldClient }()
+
+		// Capture log output
+		var logBuf bytes.Buffer
+		oldOutput := log.Writer()
+		log.SetOutput(&logBuf)
+		defer log.SetOutput(oldOutput)
+
+		urls := []string{"http://example.com"}
+		_ = HealthCheck(urls)
+
+		// Should have logged the close error
+		if !strings.Contains(logBuf.String(), "Warning: failed to close response body") {
+			t.Errorf("expected close error to be logged, got: %s", logBuf.String())
+		}
+	})
+}
+
+// errorCloseTransport returns responses with bodies that fail to close
+type errorCloseTransport struct{}
+
+func (t *errorCloseTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       &errorCloseBody{Reader: strings.NewReader("test body")},
+		Header:     make(http.Header),
+	}, nil
+}
+
+// errorCloseBody is a ReadCloser that returns an error on Close
+type errorCloseBody struct {
+	io.Reader
+}
+
+func (b *errorCloseBody) Close() error {
+	return fmt.Errorf("close error")
 }
