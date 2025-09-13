@@ -1,6 +1,6 @@
 # Fincons coding challenge
 
-L'objectif de ce challenge est d'apporter des corrections et améliorations a un petit programme permettant d'exécuter un "HealthCheck" à partir d'un fichier contenant une liste de services web.
+L'objectif de ce challenge est d'apporter des corrections et améliorations à un petit programme permettant d'exécuter un "HealthCheck" à partir d'un fichier contenant une liste de services web.
 
 ````bash
 go run main.go services.txt
